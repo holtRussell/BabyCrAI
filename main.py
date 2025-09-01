@@ -13,12 +13,9 @@ from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 
 
-
-
-# Utility function to convert audio to mel-spectrogram image
-def audio_to_melspectrogram(audio_path, save_path, sr=16000, n_mels=128, n_fft=2048, hop_length=512):
-    print(f"Converting audio to mel-spectrogram: {audio_path}")
-    y, sr = librosa.load(audio_path, sr=sr)
+# Utility function to convert audio (y) to mel-spectrogram image
+def audio_to_melspectrogram(y, sr, save_path, n_mels=128, n_fft=2048, hop_length=512):
+    print(f"Converting to mel-spectrogram: {save_path}")
     S = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=n_mels, n_fft=n_fft, hop_length=hop_length)
     S_dB = librosa.power_to_db(S, ref=np.max)
 
@@ -32,8 +29,8 @@ def audio_to_melspectrogram(audio_path, save_path, sr=16000, n_mels=128, n_fft=2
 
 
 # Paths
-audio_dir = 'data/donate_a_cry/donateacry_corpus'  # Update with actual path
-image_dir = 'data/donate_a_cry/melspectrogram_images'  # Update with actual path
+audio_dir = 'data/donate_a_cry/donateacry_corpus'  # Update with actual path if needed
+image_dir = 'data/donate_a_cry/melspectrogram_images'  # Update with actual path if needed
 print(f"Creating image directory: {image_dir}")
 os.makedirs(image_dir, exist_ok=True)
 
@@ -45,7 +42,7 @@ hop_length = 512
 classes = ['hungry', 'burping', 'discomfort', 'belly_pain', 'tired']
 print(f"Classes defined: {classes}")
 
-# Convert audio files to mel-spectrogram images
+# Convert audio files to mel-spectrogram images with variations, skip if already exists
 for class_name in classes:
     class_audio_dir = os.path.join(audio_dir, class_name)
     class_image_dir = os.path.join(image_dir, class_name)
@@ -55,13 +52,30 @@ for class_name in classes:
     for audio_file in os.listdir(class_audio_dir):
         if audio_file.endswith('.wav'):
             audio_path = os.path.join(class_audio_dir, audio_file)
-            image_name = audio_file.replace('.wav', '.jpg')
-            image_path = os.path.join(class_image_dir, image_name)
-            audio_to_melspectrogram(audio_path, image_path, sr, n_mels, n_fft, hop_length)
+            base_name = audio_file.replace('.wav', '')
+            y, sr_load = librosa.load(audio_path, sr=sr)
+
+            # Define variations
+            variations = [
+                ('orig', y),
+                ('noise', y + np.random.normal(0, 0.01, y.shape)),
+                ('stretch11', librosa.effects.time_stretch(y, rate=1.1)),
+                ('stretch09', librosa.effects.time_stretch(y, rate=0.9)),
+                ('vol12', np.clip(y * 1.2, -1.0, 1.0)),
+                ('vol08', y * 0.8)
+            ]
+
+            # Process each variation
+            for var_name, y_var in variations:
+                image_path = os.path.join(class_image_dir, f"{base_name}_{var_name}.jpg")
+                if os.path.exists(image_path):
+                    print(f"Skipping existing mel-spectrogram: {image_path}")
+                    continue
+                audio_to_melspectrogram(y_var, sr, image_path, n_mels, n_fft, hop_length)
 
 # Split dataset into train and test
-train_dir = 'path/to/train'  # Update with actual path
-test_dir = 'path/to/test'  # Update with actual path
+train_dir = 'data/train'  # Updated path
+test_dir = 'data/test'  # Updated path
 print(f"Creating train directory: {train_dir}")
 print(f"Creating test directory: {test_dir}")
 os.makedirs(train_dir, exist_ok=True)
