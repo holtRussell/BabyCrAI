@@ -115,6 +115,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         print(f'Epoch {epoch + 1}/{num_epochs}, Val Loss: {val_loss:.4f}, Val Accuracy: {val_acc:.2f}%')
 
 
+
 # Evaluation function
 def evaluate_model(model, test_loader, criterion, device):
     model.eval()
