@@ -169,7 +169,7 @@ sr = 16000
 n_mels = 128
 n_fft = 2048
 hop_length = 512
-classes = ['hungry', 'burping', 'discomfort', 'belly_pain', 'tired', 'unknown']
+classes = ['hungry', 'burping', 'discomfort', 'belly_pain', 'tired', 'unknown',]
 print(f"Classes defined: {classes}")
 
 # Convert audio files to mel-spectrogram images with variations, skip if already exists
@@ -298,6 +298,9 @@ print("Model, criterion, and optimizer initialized")
 print("Initiating training and evaluation")
 try:
     train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=50, device=device)
+    # Save the model
+    torch.save(model.state_dict(), 'baby_cry_model.pth')
+    print("Model saved as baby_cry_model.pth")
     test_acc = evaluate_model(model, test_loader, criterion, device)
     print(f"Final Testing Accuracy: {test_acc:.2f}%")
 except Exception as e:
