@@ -1,48 +1,13 @@
+import torchaudio
+import librosa
+import numpy as np
 import os
 import shutil
-from pathlib import Path
-
+from sklearn.model_selection import train_test_split
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torchaudio
-from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import train_test_split
-import librosa
-import numpy as np
-import soundfile as sf
-import matplotlib.pyplot as plt
-
-
-# Define the model class
-class BabyCryHybrid(nn.Module):
-    def __init__(self, num_classes):
-        super(BabyCryHybrid, self).__init__()
-        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm2d(32)
-        self.pool = nn.MaxPool2d(2, 2)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm2d(64)
-        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
-        self.bn3 = nn.BatchNorm2d(128)
-        self.lstm = nn.LSTM(128 * 16, 128, bidirectional=True, batch_first=True, dropout=0.3)
-        self.fc1 = nn.Linear(256, 512)
-        self.dropout = nn.Dropout(0.5)
-        self.fc2 = nn.Linear(512, num_classes)
-        self.relu = nn.ReLU()
-
-    def forward(self, x):
-        x = self.pool(self.relu(self.bn1(self.conv1(x))))
-        x = self.pool(self.relu(self.bn2(self.conv2(x))))
-        x = self = self.pool(self.relu(self.bn3(self.conv3(x))))
-        x = x.view(x.size(0), x.size(3), -1)
-        x, _ = self.lstm(x)
-        x = x[:, -1, :]
-        x = self.relu(self.fc1(x))
-        x = self.dropout(x)
-        x = self.fc2(x)
-        return x
-
+from torch.utils.data import DataLoader, Dataset
 
 # Define mel-spectrogram transformation as part of the model
 class MelSpectrogramLayer(nn.Module):
@@ -59,205 +24,336 @@ class MelSpectrogramLayer(nn.Module):
 
     def forward(self, x):
         # x: [batch, samples]
-        mel = self.mel_spec(x)
+        mel = self.mel_spec(x)  # [batch, n_mels, time_frames]
         mel_db = self.db_transform(mel)  # [batch, n_mels, time_frames]
-        # Correctly add a channel dimension and repeat it 3 times
-        mel_db = mel_db.unsqueeze(1).repeat(1, 3, 1, 1)
+        # Add channel dimension and repeat to simulate 3 channels (RGB-like) for CNN input
+        mel_db = mel_db.unsqueeze(1)  # [batch, 1, n_mels, time_frames]
+        mel_db = mel_db.repeat(1, 3, 1, 1)  # [batch, 3, n_mels, time_frames]
         return mel_db
 
+# Define Hybrid CNN-LSTM model with embedded mel-spectrogram layer
+class BabyCryHybridLite(nn.Module):
+    def __init__(self, num_classes, sample_rate=16000, n_mels=128, n_fft=2048, hop_length=512, max_length=16000):
+        super(BabyCryHybridLite, self).__init__()
+        self.mel_layer = MelSpectrogramLayer(sample_rate, n_mels, n_fft, hop_length)
+        self.max_length = max_length  # Max audio length in samples
+        self.conv1 = nn.Conv2d(3, 16, kernel_size=3, padding=1)  # Expects [batch, 3, n_mels, time_frames]
+        self.bn1 = nn.BatchNorm2d(16)
+        self.pool = nn.MaxPool2d(2, 2)
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(32)
+        self.conv3 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.bn3 = nn.BatchNorm2d(64)
+        # LSTM input size based on debug output: [batch, n_mels/8, 64 * (time_frames/8)]
+        # From debug: time_frames=32, time_frames/8=4, so 64 * 4 = 256
+        self.lstm_input_size = 256  # Feature size per time step: 64 * (time_frames/8)
+        self.lstm = nn.LSTM(self.lstm_input_size, 64, num_layers=1, bidirectional=False, batch_first=True)
+        self.fc1 = nn.Linear(64, 128)
+        self.dropout = nn.Dropout(0.3)
+        self.fc2 = nn.Linear(128, num_classes)
+        self.relu = nn.ReLU()
 
-# Custom Dataset for WAV files
+    def forward(self, x):
+        # x: [batch, samples]
+        # Pad or truncate audio to max_length
+        x = self._pad_or_truncate(x, self.max_length)
+        # Convert to mel-spectrogram
+        x = self.mel_layer(x)  # [batch, 3, n_mels, time_frames]
+
+        # CNN processing
+        x = self.pool(self.relu(self.bn1(self.conv1(x))))
+        x = self.pool(self.relu(self.bn2(self.conv2(x))))
+        x = self.pool(self.relu(self.bn3(self.conv3(x))))
+        # Reshape for LSTM: [batch, n_mels/8, 64 * (time_frames/8)]
+        x = x.view(x.size(0), x.size(2), -1)  # [batch, n_mels/8, 64 * (time_frames/8)]
+        x, _ = self.lstm(x)
+        x = x[:, -1, :]  # Take the last time step
+        x = self.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return x
+
+    def _pad_or_truncate(self, x, max_length):
+        # x: [batch, samples]
+        if x.size(1) < max_length:
+            pad_size = max_length - x.size(1)
+            x = torch.nn.functional.pad(x, (0, pad_size))  # Pad with zeros at the end
+        elif x.size(1) > max_length:
+            x = x[:, :max_length]  # Truncate
+        return x
+
+# Custom dataset for raw audio files
 class AudioDataset(Dataset):
-    def __init__(self, audio_paths, labels, transform=None, max_length=16000):
-        self.audio_paths = audio_paths
-        self.labels = labels
-        self.transform = transform
+    def __init__(self, root_dir, max_length=16000, target_sr=16000):
+        self.root_dir = root_dir
         self.max_length = max_length
+        self.target_sr = target_sr
+        self.samples = []
+        self.classes = sorted([d for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d))])
+        self.class_to_idx = {cls: i for i, cls in enumerate(self.classes)}
+        for cls in self.classes:
+            cls_dir = os.path.join(root_dir, cls)
+            for f in os.listdir(cls_dir):
+                if f.endswith('.wav'):
+                    self.samples.append((os.path.join(cls_dir, f), self.class_to_idx[cls]))
 
     def __len__(self):
-        return len(self.audio_paths)
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        audio_path = self.audio_paths[idx]
-        label = self.labels[idx]
-
-        # Load audio
-        waveform, _ = torchaudio.load(audio_path)
-
-        # Pad or truncate the waveform to a fixed length
-        if waveform.size(1) > self.max_length:
-            waveform = waveform[:, :self.max_length]
+        path, label = self.samples[idx]
+        waveform, sample_rate = torchaudio.load(path)  # Load without specifying sr
+        # Ensure mono by averaging channels if stereo
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
         else:
-            padding = self.max_length - waveform.size(1)
-            waveform = torch.nn.functional.pad(waveform, (0, padding))
+            waveform = waveform  # Already mono
+        # Resample to target_sr if necessary
+        if sample_rate != self.target_sr:
+            resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=self.target_sr)
+            waveform = resampler(waveform)
+        waveform = waveform.squeeze(0)  # Remove channel dimension after processing
+        # Pad or truncate to max_length
+        if len(waveform) < self.max_length:
+            pad_size = self.max_length - len(waveform)
+            waveform = torch.nn.functional.pad(waveform, (0, pad_size))
+        else:
+            waveform = waveform[:self.max_length]
+        return waveform, torch.tensor(label, dtype=torch.long)
 
-        # Apply the transform (Mel-spectrogram conversion)
-        if self.transform:
-            mel_spec = self.transform(waveform)
-
-        return mel_spec.squeeze(0), label
-
-
-# Train model function
-def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=10, device='cpu'):
-    print("Starting training...")
+# Training function with early stopping
+def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=50, device='cpu'):
+    early_stopper = EarlyStopper(patience=5, min_delta=0)  # Use the provided class
+    print("Starting model training")
     for epoch in range(num_epochs):
+        # Training phase
         model.train()
         running_loss = 0.0
-        for inputs, labels in train_loader:
-            inputs = inputs.to(device)
-            labels = labels.to(device)
-            optimizer.zero_grad()
+        correct = 0
+        total = 0
+        print(f"Epoch {epoch + 1}/{num_epochs} started (Training)")
+        try:
+            for batch_idx, (inputs, labels) in enumerate(train_loader):
+                inputs, labels = inputs.to(device), labels.to(device)
+                optimizer.zero_grad()
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+                loss.backward()
+                optimizer.step()
+                running_loss += loss.item()
+                _, predicted = torch.max(outputs.data, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+                if batch_idx % 10 == 0:  # Print every 10 batches
+                    print(f"Batch {batch_idx}, Loss: {loss.item():.4f}")
+        except Exception as e:
+            print(f"Error in training epoch {epoch + 1}: {str(e)}")
+            raise  # Re-raise to debug the error
+
+        epoch_acc = 100 * correct / total
+        print(
+            f'Epoch {epoch + 1}/{num_epochs}, Train Loss: {running_loss / len(train_loader):.4f}, Train Accuracy: {epoch_acc:.2f}%')
+
+        # Validation phase
+        model.eval()
+        val_loss = 0.0
+        val_correct = 0
+        val_total = 0
+        with torch.no_grad():
+            try:
+                for inputs, labels in val_loader:
+                    inputs, labels = inputs.to(device), labels.to(device)
+                    outputs = model(inputs)
+                    loss = criterion(outputs, labels)
+                    val_loss += loss.item()
+                    _, predicted = torch.max(outputs.data, 1)
+                    val_total += labels.size(0)
+                    val_correct += (predicted == labels).sum().item()
+            except Exception as e:
+                print(f"Error in validation epoch {epoch + 1}: {str(e)}")
+                raise  # Re-raise to debug the error
+        val_acc = 100 * val_correct / val_total
+        val_loss /= len(val_loader)
+        print(f'Epoch {epoch + 1}/{num_epochs}, Val Loss: {val_loss:.4f}, Val Accuracy: {val_acc:.2f}%')
+
+        # Early stopping check
+        if early_stopper.early_stop(val_loss):
+            print(f'Early stopping at epoch {epoch + 1}')
+            break
+
+# Evaluation function
+def evaluate_model(model, test_loader, criterion, device):
+    model.eval()
+    print("Starting model evaluation")
+    correct = 0
+    total = 0
+    running_loss = 0.0
+    with torch.no_grad():
+        for batch_idx, (inputs, labels) in enumerate(test_loader):
+            inputs, labels = inputs.to(device), labels.to(device)
             outputs = model(inputs)
             loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-            running_loss += loss.item() * inputs.size(0)
+            running_loss += loss.item()
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+            print(f"Test Batch {batch_idx}, Loss: {loss.item():.4f}")
+    test_acc = 100 * correct / total
+    print(f'Test Loss: {running_loss / len(test_loader):.4f}, Test Accuracy: {test_acc:.2f}%')
+    return test_acc
 
-        epoch_loss = running_loss / len(train_loader.dataset)
-        print(f"Epoch {epoch + 1}/{num_epochs} - Training Loss: {epoch_loss:.4f}")
+# EarlyStopper class
+class EarlyStopper:
+    def __init__(self, patience=1, min_delta=0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.min_validation_loss = float('inf')
 
-    print("Training complete.")
+    def early_stop(self, validation_loss):
+        if validation_loss < self.min_validation_loss:
+            self.min_validation_loss = validation_loss
+            self.counter = 0
+        elif validation_loss > (self.min_validation_loss + self.min_delta):
+            self.counter += 1
+            if self.counter >= self.patience:
+                return True
+        return False
 
+# Paths
+audio_dir = 'data/total_dataset/'  # Original audio files
+augmented_dir = 'data/augmented_audio'  # New directory for augmented audio files
+print(f"Source audio directory: {audio_dir}")
+print(f"Augmented audio directory: {augmented_dir}")
 
-def augment_and_save_audio(input_base_dir, output_base_dir, sample_rate=16000):
-    """
-    Reads audio files from a base directory, applies augmentations, and saves them
-    to a new directory with the same folder structure.
+# Parameters
+sr = 16000
+classes = ['hungry', 'burping', 'discomfort', 'belly_pain', 'tired', 'unknown']
+print(f"Classes defined: {classes}")
 
-    Args:
-        input_base_dir (str): The base directory containing class subfolders of WAV files.
-        output_base_dir (str): The base directory where augmented audio will be saved.
-        sample_rate (int): The target sample rate for audio processing.
-    """
-    input_base_path = Path(input_base_dir)
-    output_base_path = Path(output_base_dir)
+# Generate augmented audio files and store them in a separate augmented directory
+os.makedirs(augmented_dir, exist_ok=True)
+for class_name in classes:
+    class_audio_dir = os.path.join(audio_dir, class_name)
+    class_augmented_dir = os.path.join(augmented_dir, class_name)
+    print(f"Processing augmentations for class: {class_name}")
+    print(f"Creating augmented class directory: {class_augmented_dir}")
+    os.makedirs(class_augmented_dir, exist_ok=True)
 
-    # If the output directory exists, remove it and create a fresh one to avoid duplicates.
-    if output_base_path.exists() and output_base_path.is_dir():
-        print(f"Removing existing directory: {output_base_path}")
-        shutil.rmtree(output_base_path)
-    output_base_path.mkdir(parents=True, exist_ok=True)
+    if not os.path.exists(class_audio_dir):
+        print(f"Directory {class_audio_dir} does not exist, skipping.")
+        continue
+    originals = [f for f in os.listdir(class_audio_dir) if f.endswith('.wav')]
+    for audio_file in originals:
+        audio_path = os.path.join(class_audio_dir, audio_file)
+        base_name = audio_file.replace('.wav', '')
+        y, _ = librosa.load(audio_path, sr=sr)
 
-    # Iterate through each class folder in the input directory
-    for class_name in os.listdir(input_base_path):
-        class_audio_dir = input_base_path / class_name
-        if not class_audio_dir.is_dir():
-            continue
+        # Save original audio to augmented directory (to include it in dataset)
+        orig_path = os.path.join(class_augmented_dir, audio_file)
+        if not os.path.exists(orig_path):
+            shutil.copy(audio_path, orig_path)
+            print(f"Copied original audio to augmented directory: {orig_path}")
 
-        # Create the corresponding class directory in the output folder
-        class_output_dir = output_base_path / class_name
-        class_output_dir.mkdir(exist_ok=True)
+        # Define variations
+        variations = [
+            ('noise', y + np.random.normal(0, 0.01, y.shape)),
+            ('stretch11', librosa.effects.time_stretch(y, rate=1.1)),
+            ('stretch09', librosa.effects.time_stretch(y, rate=0.9)),
+            ('vol12', np.clip(y * 1.2, -1.0, 1.0)),
+            ('vol08', y * 0.8)
+        ]
 
-        print(f"Processing audio files from: {class_audio_dir}")
-
-        # Process each audio file
-        for audio_file in os.listdir(class_audio_dir):
-            if not audio_file.endswith('.wav'):
+        # Process each variation
+        for var_name, y_var in variations:
+            var_path = os.path.join(class_augmented_dir, f"{base_name}_{var_name}.wav")
+            if os.path.exists(var_path):
+                print(f"Skipping existing augmented audio: {var_path}")
                 continue
+            waveform_tensor = torch.from_numpy(y_var).unsqueeze(0).float()
+            torchaudio.save(var_path, waveform_tensor, sr)
+            print(f"Saved augmented audio: {var_path}")
 
-            audio_path = class_audio_dir / audio_file
-            base_name = os.path.splitext(audio_file)[0]
+# Split dataset into train, val, and test (70/15/15) using augmented directory
+train_dir = 'data/audio/train'  # Updated path
+val_dir = 'data/audio/val'  # New val path
+test_dir = 'data/audio/test'  # Updated path
+print(f"Creating train directory: {train_dir}")
+print(f"Creating val directory: {val_dir}")
+print(f"Creating test directory: {test_dir}")
+os.makedirs(train_dir, exist_ok=True)
+os.makedirs(val_dir, exist_ok=True)
+os.makedirs(test_dir, exist_ok=True)
 
-            try:
-                # Load audio
-                y, sr_load = torchaudio.load(audio_path)
-                # Ensure it's a 1D float32 numpy array, which is a reliable format for soundfile
-                y = y.squeeze().numpy().astype(np.float32)
-            except Exception as e:
-                print(f"Error loading {audio_path}: {e}")
-                continue
+for class_name in classes:
+    class_augmented_dir = os.path.join(augmented_dir, class_name)
+    train_class_dir = os.path.join(train_dir, class_name)
+    val_class_dir = os.path.join(val_dir, class_name)
+    test_class_dir = os.path.join(test_dir, class_name)
+    print(f"Creating train class directory: {train_class_dir}")
+    print(f"Creating val class directory: {val_class_dir}")
+    print(f"Creating test class directory: {test_class_dir}")
+    os.makedirs(train_class_dir, exist_ok=True)
+    os.makedirs(val_class_dir, exist_ok=True)
+    os.makedirs(test_class_dir, exist_ok=True)
 
-            # Define variations
-            variations = [
-                ('orig', y),
-                ('noise', y + np.random.normal(0, 0.01, y.shape)),
-                ('stretch11', librosa.effects.time_stretch(y, rate=1.1)),
-                ('stretch09', librosa.effects.time_stretch(y, rate=0.9)),
-                ('vol12', np.clip(y * 1.2, -1.0, 1.0)),
-                ('vol08', y * 0.8)
-            ]
+    all_files = [f for f in os.listdir(class_augmented_dir) if f.endswith('.wav')]
+    print(f"Found {len(all_files)} audio files in {class_augmented_dir}")
 
-            # Process each variation and save as a new audio file
-            for var_name, y_var in variations:
-                # Construct the output filename
-                output_file_name = f"{base_name}_{var_name}.wav"
-                output_path = class_output_dir / output_file_name
+    # Split into train and temp (70/30, where temp is val+test)
+    train_files, temp_files = train_test_split(all_files, test_size=0.3, random_state=42)
+    # Split temp into val and test (50/50 of temp, i.e., 15/15 overall)
+    val_files, test_files = train_test_split(temp_files, test_size=0.5, random_state=42)
 
-                # The key fix: ensure the augmented data is always float32 before saving.
-                y_var_safe = y_var.astype(np.float32)
+    print(
+        f"Split for {class_name}: {len(train_files)} train, {len(val_files)} val, {len(test_files)} test files")
 
-                try:
-                    # Check if the augmented data is empty or malformed
-                    if not y_var_safe.size > 0:
-                        print(f"  - WARNING: Augmented data for '{output_file_name}' is empty. Skipping save.")
-                        continue
+    for f in train_files:
+        shutil.copy(os.path.join(class_augmented_dir, f), os.path.join(train_class_dir, f))
+        print(f"Copied to train: {f}")
+    for f in val_files:
+        shutil.copy(os.path.join(class_augmented_dir, f), os.path.join(val_class_dir, f))
+        print(f"Copied to val: {f}")
+    for f in test_files:
+        shutil.copy(os.path.join(class_augmented_dir, f), os.path.join(test_class_dir, f))
+        print(f"Copied to test: {f}")
 
-                    # Attempt to save the file with robust error handling
-                    sf.write(output_path, y_var_safe, sr_load)
-                    print(f"  - Saved {output_file_name}")
-                except sf.LibsndfileError as e:
-                    print(f"  - ERROR: Could not save '{output_file_name}'. Issue with data format. Skipping file.")
-                    print(f"    Details: {e}")
-                except Exception as e:
-                    print(f"  - An unexpected error occurred while saving '{output_file_name}': {e}")
+# Load datasets using custom AudioDataset
+print(f"Loading train dataset from: {train_dir}")
+train_dataset = AudioDataset(train_dir, max_length=16000, target_sr=16000)
+print(f"Loading val dataset from: {val_dir}")
+val_dataset = AudioDataset(val_dir, max_length=16000, target_sr=16000)
+print(f"Loading test dataset from: {test_dir}")
+test_dataset = AudioDataset(test_dir, max_length=16000, target_sr=16000)
 
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+print(f"Train loader created with {len(train_dataset)} samples")
+print(f"Val loader created with {len(val_dataset)} samples")
+print(f"Test loader created with {len(test_dataset)} samples")
 
-# Main execution block
-if __name__ == '__main__':
-    # 1. Define directories
-    input_directory = Path("data/donate_a_cry/donateacry_corpus")
-    output_directory = Path("data/converted_audio")
+# Initialize device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 
-    # 2. Augment and save the audio files
-    augment_and_save_audio(input_directory, output_directory)
+# Initialize model, loss, and optimizer
+# Optional: Disable CuDNN if previous issue persists
+# torch.backends.cudnn.enabled = False
+model = BabyCryHybridLite(num_classes=len(classes)).to(device)
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+print("Model, criterion, and optimizer initialized")
 
-    # 3. Prepare data for training
-    all_audio_paths = []
-    all_labels = []
-    class_to_idx = {}
-
-    classes = sorted(os.listdir(output_directory))
-    for cls_name in classes:
-        cls_path = output_directory / cls_name
-        if not cls_path.is_dir():
-            continue
-
-        if cls_name not in class_to_idx:
-            class_to_idx[cls_name] = len(class_to_idx)
-
-        for audio_file in cls_path.glob('*.wav'):
-            all_audio_paths.append(audio_file)
-            all_labels.append(class_to_idx[cls_name])
-
-    # 4. Split data into train, validation, and test sets
-    train_paths, test_paths, train_labels, test_labels = train_test_split(
-        all_audio_paths, all_labels, test_size=0.2, random_state=42, stratify=all_labels
-    )
-    train_paths, val_paths, train_labels, val_labels = train_test_split(
-        train_paths, train_labels, test_size=0.2, random_state=42, stratify=train_labels
-    )
-
-    print(f"Training set size: {len(train_paths)}")
-    print(f"Validation set size: {len(val_paths)}")
-    print(f"Test set size: {len(test_paths)}")
-
-    # 5. Create datasets and data loaders
-    audio_transform = MelSpectrogramLayer()
-    train_dataset = AudioDataset(train_paths, train_labels, transform=audio_transform)
-    val_dataset = AudioDataset(val_paths, val_labels, transform=audio_transform)
-
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
-
-    # 6. Initialize model, criterion, and optimizer
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = BabyCryHybrid(num_classes=len(classes)).to(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-
-    # 7. Train and evaluate
+# Train and evaluate
+print("Initiating training and evaluation")
+try:
     train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=50, device=device)
-    torch.save(model.state_dict(), 'baby_cry_model_lite.pth')
-
-    print("Training complete. Model saved.")
+    # Save the model
+    torch.save(model.state_dict(), 'baby_cry_audio_embedded.pth')
+    print("Model saved as baby_cry_model_lite.pth")
+    test_acc = evaluate_model(model, test_loader, criterion, device)
+    print(f"Final Testing Accuracy: {test_acc:.2f}%")
+except Exception as e:
+    print(f"Training halted due to error: {str(e)}")
+    raise
